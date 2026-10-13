@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Read-only, value-free Codex package and process clues."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import time
+
+VERSION = "0.1.0"
+FAMILIES = ("app-server-daemon", "standalone")
+
+
+def safe_dir(path):
+    path = Path(os.path.abspath(path))
+    for part in (path,) + tuple(path.parents):
+        if part.is_symlink():
+            raise ValueError("symlink")
+    return path
+
+
+def inventory(root, max_entries=50000, seconds=5):
+    result = []
+    deadline = time.monotonic() + seconds
+    visited = 0
+    for family in FAMILIES:
+        row = {"family": family, "state": "UNKNOWN", "release_directories": 0,
+               "regular_files": 0, "logical_bytes": 0, "skipped_links": 0}
+        result.append(row)
+        try:
+            base = safe_dir(Path(root) / family / "releases")
+            try:
+                info = base.stat()
+            except FileNotFoundError:
+                row["state"] = "NOT_OBSERVED"
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("not a directory")
+            stack = []
+            with os.scandir(base) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > max_entries or time.monotonic() > deadline:
+                        raise ValueError("bounded scan")
+                    if entry.is_symlink():
+                        row["skipped_links"] += 1
+                    elif entry.is_dir(follow_symlinks=False):
+                        row["release_directories"] += 1
+                        stack.append(entry.path)
+            seen = set()
+            while stack:
+                current = safe_dir(stack.pop())
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        visited += 1
+                        if visited > max_entries or time.monotonic() > deadline:
+                            raise ValueError("bounded scan")
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISLNK(info.st_mode):
+                            row["skipped_links"] += 1
+                        elif stat.S_ISDIR(info.st_mode):
+                            stack.append(entry.path)
+                        elif stat.S_ISREG(info.st_mode):
+                            identity = (info.st_dev, info.st_ino)
+                            if identity not in seen:
+                                seen.add(identity)
+                                row["regular_files"] += 1
+                                row["logical_bytes"] += info.st_size
+            row["state"] = "OBSERVED"
+        except (OSError, ValueError):
+            pass
+    return result
+
+
+def process_clues(text):
+    counts = {"managed_daemon_matches": 0, "updater_matches": 0}
+    for line in text.splitlines():
+        try:
+            words = line.split()
+            executable = Path(words[0]).name
+        except IndexError:
+            continue
+        if executable != "codex":
+            continue
+        if words[1:3] != ["app-server", "daemon"] and words[1:2] != ["app-server"]:
+            continue
+        if words[1:4] == ["app-server", "daemon", "pid-update-loop"]:
+            counts["updater_matches"] += 1
+        elif words[1:2] == ["app-server"] and "--managed-daemon" in words[2:]:
+            counts["managed_daemon_matches"] += 1
+    return {"state": "OBSERVED", **counts}
+
+
+def read_process_file(path):
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise ValueError("regular file required")
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError("regular file required")
+        content = source.read(2000001)
+    if len(content) > 2000000:
+        raise ValueError("input too large")
+    return content.decode("utf-8", errors="replace")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--packages-root", type=Path,
+                        default=Path.home() / ".codex" / "packages")
+    parser.add_argument("--process-file", type=Path,
+                        help="saved ps command column; strict offline process mode")
+    parser.add_argument("--no-processes", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    processes = {"state": "NOT_OBSERVED"}
+    if not args.no_processes:
+        try:
+            if args.process_file:
+                text = read_process_file(args.process_file)
+            else:
+                proc = subprocess.run(["ps", "-ax", "-o", "command="],
+                                      capture_output=True, text=True, timeout=3,
+                                      check=True)
+                text = proc.stdout
+                if len(text) > 2000000:
+                    raise ValueError("process output too large")
+            processes = process_clues(text)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            processes = {"state": "UNKNOWN"}
+    packages = inventory(args.packages_root)
+    report = {"schema_version": 1, "packages": packages, "processes": processes,
+              "limitations": "Counts are clues, not ownership, duplicates, reclaimable space or orphan proof."}
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print("AgentDaemon Lens " + VERSION + " — read-only Codex clues")
+        for row in packages:
+            print("{family}: {state}; releases={release_directories}; logical_bytes={logical_bytes}; skipped_links={skipped_links}".format(**row))
+        print("Processes: " + json.dumps(processes, sort_keys=True))
+        print(report["limitations"])
+    unknown = any(row["state"] == "UNKNOWN" for row in packages) or processes["state"] == "UNKNOWN"
+    finding = any(row["release_directories"] > 1 for row in packages) or processes.get("updater_matches", 0) > 0 or processes.get("managed_daemon_matches", 0) > 0
+    return (2 if unknown else 1 if finding else 0) if args.check else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
