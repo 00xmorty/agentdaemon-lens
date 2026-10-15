@@ -26,6 +26,23 @@ python3 agentdaemon-lens --packages-root ./sample-packages --process-file ./save
 
 `--check`: 0 = no selected clue observed; 1 = multiple release directories or a matching daemon/updater; 2 = an incomplete/failed query (`UNKNOWN`, takes precedence). Without `--check`, diagnostics exit 0; invalid CLI arguments exit 2.
 
+## Compare two saved inventories (v0.2.0)
+
+Capture on the same machine, with the same package root and permissions, before and after a change you choose to make outside this tool:
+
+```sh
+python3 agentdaemon-lens --no-processes --json > before.json
+# Later, after your own controlled change:
+python3 agentdaemon-lens --no-processes --json > after.json
+python3 agentdaemon-lens --compare before.json after.json --json --check
+```
+
+Comparison reads only the two supplied regular JSON files: no `ps`, package traversal, Codex execution, network or automatic writes. It accepts v0.1.0/v0.2.0 schema-1 inventory snapshots; it rejects acquisition flags in comparison mode. Output includes signed deltas for logical bytes, regular files and release directories per fixed family, and the before/after observation states. It does not echo extra JSON fields, names or paths. Input files are capped at 2 MB each; malformed/unsupported snapshots exit 2 with a value-free error.
+
+Comparison `--check`: 0 = no aggregate difference; 1 = at least one aggregate difference; 2 = any family has `UNKNOWN` or skipped symlinks (takes precedence). Without `--check`, a valid comparison exits 0 even when incomplete. Incomplete families have null deltas, never guessed zeros. `NOT_OBSERVED` means zero visible entries, not proven absence. Review before/after states.
+
+Snapshots have no device/root identity: you must ensure they describe comparable environments. Process counts are intentionally not compared. Equal totals do not mean identical contents; negative logical bytes do not prove reclaimed disk space, causation or successful use. This tool neither performs nor recommends cleanup.
+
 ## Example (synthetic fixture)
 
 Two three-byte package files in separate release directories yield `release_directories=2`, `logical_bytes=6`. This is not proof of duplicate content or reclaimable disk space. Unit tests create and exercise this example.

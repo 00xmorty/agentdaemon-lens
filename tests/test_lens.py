@@ -107,5 +107,88 @@ class LensTests(unittest.TestCase):
         self.assertEqual(lens.inventory(self.root)[1]['state'], 'UNKNOWN')
 
 
+    def snapshot(self):
+        return {'schema_version': 1, 'packages': lens.inventory(self.root)}
+
+    def test_comparison_growth_and_decrease(self):
+        before = self.snapshot()
+        self.release()
+        after = self.snapshot()
+        row = lens.compare_snapshots(before, after)['packages'][0]
+        self.assertEqual((row['release_directories_delta'], row['logical_bytes_delta']), (1, 3))
+        self.assertEqual(lens.compare_snapshots(after, before)['packages'][0]['logical_bytes_delta'], -3)
+
+    def test_comparison_absence_and_reordered_families(self):
+        before = self.snapshot()
+        after = self.snapshot(); after['packages'].reverse()
+        result = lens.compare_snapshots(before, after)
+        self.assertEqual(result['packages'][1]['state'], 'COMPARABLE')
+        self.assertEqual(result['packages'][1]['logical_bytes_delta'], 0)
+
+    def test_comparison_unknown_and_skipped_links(self):
+        for field, value in [('state', 'UNKNOWN'), ('skipped_links', 1)]:
+            before, after = self.snapshot(), self.snapshot()
+            after['packages'][0][field] = value
+            row = lens.compare_snapshots(before, after)['packages'][0]
+            self.assertEqual(row['state'], 'UNKNOWN')
+            self.assertIsNone(row['logical_bytes_delta'])
+
+    def test_comparison_invalid_inputs(self):
+        import copy
+        good = self.snapshot()
+        invalid = [None, [], {}, {'schema_version': True}, {'schema_version': 2}]
+        for key, value in [('logical_bytes', -1), ('logical_bytes', True), ('logical_bytes', '3'), ('logical_bytes', 1.5), ('logical_bytes', 2**63), ('state', 'made-up'), ('family', []), ('family', 'private')]:
+            bad = copy.deepcopy(good); bad['packages'][0][key] = value; invalid.append(bad)
+        bad = copy.deepcopy(good); bad['packages'][1] = bad['packages'][0]; invalid.append(bad)
+        bad = copy.deepcopy(good); bad['packages'][1]['logical_bytes'] = 3; invalid.append(bad)
+        bad = copy.deepcopy(good); del bad['packages'][0]['regular_files']; invalid.append(bad)
+        for bad in invalid:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                lens.compare_snapshots(good, bad)
+
+    def test_comparison_does_not_echo_extra_values(self):
+        before, after = self.snapshot(), self.snapshot()
+        after['private'] = 'PRIVATE_SECRET'; after['packages'][0]['path'] = 'PRIVATE_SECRET'
+        self.assertNotIn('PRIVATE_SECRET', json.dumps(lens.compare_snapshots(before, after)))
+
+    def compare_cli(self, before, after, *extra):
+        a, b = self.root / 'before.json', self.root / 'after.json'
+        a.write_text(json.dumps(before)); b.write_text(json.dumps(after))
+        return subprocess.run([sys.executable, str(ROOT / 'agentdaemon-lens'), '--compare', str(a), str(b), '--json', '--check', *extra], capture_output=True, text=True)
+
+    def test_comparison_cli_check_codes(self):
+        before = self.snapshot()
+        self.assertEqual(self.compare_cli(before, before).returncode, 0)
+        self.release()
+        after = self.snapshot()
+        run = self.compare_cli(before, after)
+        self.assertEqual(run.returncode, 1)
+        self.assertEqual(json.loads(run.stdout)['packages'][0]['logical_bytes_delta'], 3)
+        after['packages'][1]['state'] = 'UNKNOWN'
+        self.assertEqual(self.compare_cli(before, after).returncode, 2)
+
+    def test_comparison_invalid_cli_no_traceback_or_values(self):
+        run = self.compare_cli(self.snapshot(), {'private': 'PRIVATE_SECRET'})
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(run.stdout, '')
+        self.assertNotIn('PRIVATE_SECRET', run.stderr)
+        self.assertNotIn('Traceback', run.stderr)
+
+    def test_comparison_no_live_probes(self):
+        a = self.root / 'saved.json'; a.write_text(json.dumps(self.snapshot()))
+        with patch.object(sys, 'argv', ['lens', '--compare', str(a), str(a)]), patch.object(lens.subprocess, 'run', side_effect=AssertionError('live probe')), patch.object(lens, 'inventory', side_effect=AssertionError('filesystem inventory')):
+            self.assertEqual(lens.main(), 0)
+
+    def test_comparison_rejects_acquisition_flags(self):
+        for flags in [('--packages-root', '.'), ('--process-file', 'x'), ('--no-processes',)]:
+            run = self.compare_cli(self.snapshot(), self.snapshot(), *flags)
+            self.assertEqual(run.returncode, 2)
+
+    def test_symlink_saved_input_rejected(self):
+        source = self.root / 'source'; source.write_text('{}')
+        alias = self.root / 'alias'; alias.symlink_to(source)
+        with self.assertRaises(ValueError): lens.read_process_file(alias)
+
+
 if __name__ == '__main__':
     unittest.main()
